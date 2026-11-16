@@ -1,0 +1,12 @@
+{
+  "name": "github-core-clone",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
