@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 export const TOKEN_OWNER = 'adaiversen';
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 
+// A fixed set of repositories makes conformance runs deterministic: the same
+// names, descriptions and visibility flags appear in every trial.
 const SEEDED_REPOSITORIES = [
   ['amber-thistle', 'the tooling behind the thing', false],
   ['happy-willow', 'a sandbox for the next idea', false],
@@ -36,13 +38,20 @@ const SEEDED_REPOSITORIES = [
   ['amber-badger', 'a small service with a sharp edge', false],
 ];
 
+const COMMIT_STAMP = '1735689600 +0000';
+
+function toBuffer(value) {
+  return Buffer.isBuffer(value) ? value : Buffer.from(value);
+}
+
 export function sha1(value) {
   return createHash('sha1').update(value).digest('hex');
 }
 
 export function hashObject(type, data) {
-  const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  return sha1(Buffer.concat([Buffer.from(`${type} ${body.length}\0`), body]));
+  const body = toBuffer(data);
+  const header = Buffer.from(`${type} ${body.length}\0`);
+  return sha1(Buffer.concat([header, body]));
 }
 
 export function parseCommit(data) {
@@ -84,7 +93,8 @@ function isDirectoryMode(mode) {
 }
 
 function treeSortKey(entry) {
-  return `${entry.name}${isDirectoryMode(entry.mode) ? '/' : '\0'}`;
+  const suffix = isDirectoryMode(entry.mode) ? '/' : '\0';
+  return `${entry.name}${suffix}`;
 }
 
 function encodeTree(entries) {
@@ -105,54 +115,72 @@ function object(repo, oid) {
 }
 
 function objectType(repo, oid) {
-  return object(repo, oid)?.type ?? null;
+  const found = object(repo, oid);
+  return found ? found.type : null;
 }
 
 function putObject(repo, type, data) {
-  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const bytes = toBuffer(data);
   const oid = hashObject(type, bytes);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data: bytes });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data: bytes });
+  }
   return oid;
 }
 
 function flattenTree(repo, treeOid, prefix = '', files = new Map()) {
   const tree = object(repo, treeOid);
   if (!tree || tree.type !== 'tree') return files;
+
   for (const entry of parseTree(tree.data)) {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (isDirectoryMode(entry.mode)) flattenTree(repo, entry.oid, path, files);
-    else {
-      const blob = object(repo, entry.oid);
-      if (blob) files.set(path, { oid: entry.oid, mode: entry.mode, type: blob.type, data: blob.data });
+    if (isDirectoryMode(entry.mode)) {
+      flattenTree(repo, entry.oid, path, files);
+      continue;
+    }
+    const blob = object(repo, entry.oid);
+    if (blob) {
+      files.set(path, { oid: entry.oid, mode: entry.mode, type: blob.type, data: blob.data });
     }
   }
   return files;
 }
 
+function emptyTreeNode() {
+  return { files: new Map(), dirs: new Map() };
+}
+
+function insertIntoTree(root, path, entry) {
+  const parts = path.split('/').filter(Boolean);
+  if (!parts.length) return;
+  let node = root;
+  for (const part of parts.slice(0, -1)) {
+    if (!node.dirs.has(part)) {
+      node.dirs.set(part, emptyTreeNode());
+    }
+    node = node.dirs.get(part);
+  }
+  node.files.set(parts[parts.length - 1], entry);
+}
+
+function writeTreeNode(repo, node) {
+  const entries = [];
+  for (const [name, value] of node.files) {
+    const oid = value.oid ?? putObject(repo, value.type ?? 'blob', value.data);
+    entries.push({ mode: value.mode ?? '100644', name, oid });
+  }
+  for (const [name, child] of node.dirs) {
+    entries.push({ mode: '40000', name, oid: writeTreeNode(repo, child) });
+  }
+  return putObject(repo, 'tree', encodeTree(entries));
+}
+
 function treeFromFiles(repo, files) {
-  const root = { files: new Map(), dirs: new Map() };
+  const root = emptyTreeNode();
   for (const [path, entry] of files) {
-    const parts = path.split('/').filter(Boolean);
-    if (!parts.length) continue;
-    let node = root;
-    for (const part of parts.slice(0, -1)) {
-      if (!node.dirs.has(part)) node.dirs.set(part, { files: new Map(), dirs: new Map() });
-      node = node.dirs.get(part);
-    }
-    node.files.set(parts[parts.length - 1], entry);
+    insertIntoTree(root, path, entry);
   }
-  function write(node) {
-    const entries = [];
-    for (const [name, value] of node.files) {
-      const oid = value.oid ?? putObject(repo, value.type ?? 'blob', value.data);
-      entries.push({ mode: value.mode ?? '100644', name, oid });
-    }
-    for (const [name, child] of node.dirs) {
-      entries.push({ mode: '40000', name, oid: write(child) });
-    }
-    return putObject(repo, 'tree', encodeTree(entries));
-  }
-  return write(root);
+  return writeTreeNode(repo, root);
 }
 
 export function filesAt(repo, refOrOid) {
@@ -160,19 +188,29 @@ export function filesAt(repo, refOrOid) {
   const commit = object(repo, oid);
   if (!commit || commit.type !== 'commit') return new Map();
   const parsed = parseCommit(commit.data);
-  return parsed.tree ? flattenTree(repo, parsed.tree) : new Map();
+  if (!parsed.tree) return new Map();
+  return flattenTree(repo, parsed.tree);
+}
+
+function commitAuthor() {
+  return `${TOKEN_OWNER} <${TOKEN_OWNER}@users.noreply.github.com>`;
+}
+
+function commitBody(tree, parent, message) {
+  const author = commitAuthor();
+  const headers = [`tree ${tree}`];
+  if (parent) headers.push(`parent ${parent}`);
+  headers.push(`author ${author} ${COMMIT_STAMP}`);
+  headers.push(`committer ${author} ${COMMIT_STAMP}`);
+  const text = `${headers.join('\n')}\n\n${message || 'Update repository'}\n`;
+  return Buffer.from(text, 'utf8');
 }
 
 export function makeCommit(repo, ref, files, message, options = {}) {
   const current = repo.refs.get(ref) ?? null;
   const parent = options.parent === undefined ? current : options.parent;
   const tree = treeFromFiles(repo, files);
-  const stamp = '1735689600 +0000';
-  const author = `${TOKEN_OWNER} <${TOKEN_OWNER}@users.noreply.github.com>`;
-  const headers = [`tree ${tree}`];
-  if (parent) headers.push(`parent ${parent}`);
-  headers.push(`author ${author} ${stamp}`, `committer ${author} ${stamp}`);
-  const body = Buffer.from(`${headers.join('\n')}\n\n${message || 'Update repository'}\n`, 'utf8');
+  const body = commitBody(tree, parent, message);
   const commit = putObject(repo, 'commit', body);
   repo.refs.set(ref, commit);
   return commit;
@@ -181,6 +219,7 @@ export function makeCommit(repo, ref, files, message, options = {}) {
 export function isAncestor(repo, ancestor, descendant) {
   if (ancestor === ZERO_OID) return true;
   if (ancestor === descendant) return true;
+
   const pending = [descendant];
   const seen = new Set();
   while (pending.length) {
@@ -197,19 +236,23 @@ export function isAncestor(repo, ancestor, descendant) {
   return false;
 }
 
+function collectAncestors(repo, start, into) {
+  const pending = [start];
+  while (pending.length) {
+    const oid = pending.pop();
+    if (into.has(oid)) continue;
+    into.add(oid);
+    const entry = object(repo, oid);
+    if (entry?.type === 'commit') {
+      pending.push(...parseCommit(entry.data).parents);
+    }
+  }
+}
+
 export function commonAncestor(repo, left, right) {
   const ancestors = new Set();
-  const collect = (start, into) => {
-    const pending = [start];
-    while (pending.length) {
-      const oid = pending.pop();
-      if (into.has(oid)) continue;
-      into.add(oid);
-      const entry = object(repo, oid);
-      if (entry?.type === 'commit') pending.push(...parseCommit(entry.data).parents);
-    }
-  };
-  collect(left, ancestors);
+  collectAncestors(repo, left, ancestors);
+
   const pending = [right];
   const seen = new Set();
   while (pending.length) {
@@ -218,9 +261,31 @@ export function commonAncestor(repo, left, right) {
     seen.add(oid);
     if (ancestors.has(oid)) return oid;
     const entry = object(repo, oid);
-    if (entry?.type === 'commit') pending.push(...parseCommit(entry.data).parents);
+    if (entry?.type === 'commit') {
+      pending.push(...parseCommit(entry.data).parents);
+    }
   }
   return null;
+}
+
+function initialRepo(owner, name, options, seeded) {
+  return {
+    id: options.id,
+    owner,
+    name,
+    seeded,
+    description: options.description ?? '',
+    private: options.private === true,
+    defaultBranch: options.defaultBranch || 'main',
+    createdAt: '2025-01-01T00:00:00Z',
+    refs: new Map(),
+    objects: new Map(),
+    issues: new Map(),
+    pulls: new Map(),
+    labels: new Map(),
+    nextIssue: 1,
+    nextPull: 1,
+  };
 }
 
 export class ForgeStore {
@@ -230,6 +295,7 @@ export class ForgeStore {
     this.nextIssueId = 1;
     this.nextCommentId = 1;
     this.nextPullId = 1;
+
     for (let index = 0; index < SEEDED_REPOSITORIES.length; index += 1) {
       const [name, description, isPrivate] = SEEDED_REPOSITORIES[index];
       this.createRepo(TOKEN_OWNER, name, {
@@ -241,7 +307,9 @@ export class ForgeStore {
   }
 
   key(owner, name) {
-    return `${String(owner).toLowerCase()}/${String(name).toLowerCase()}`;
+    const normalizedOwner = String(owner).toLowerCase();
+    const normalizedName = String(name).toLowerCase();
+    return `${normalizedOwner}/${normalizedName}`;
   }
 
   getRepo(owner, name) {
@@ -252,25 +320,16 @@ export class ForgeStore {
     const normalizedOwner = String(owner || TOKEN_OWNER);
     const normalizedName = String(name || '');
     if (!normalizedName) return null;
+
     const key = this.key(normalizedOwner, normalizedName);
     if (this.repos.has(key)) return null;
-    const repo = {
+
+    const repo = initialRepo(normalizedOwner, normalizedName, {
       id: options.id ?? this.nextRepoId++,
-      owner: normalizedOwner,
-      name: normalizedName,
-      seeded: options.id !== undefined,
-      description: options.description ?? '',
-      private: options.private === true,
-      defaultBranch: options.defaultBranch || 'main',
-      createdAt: '2025-01-01T00:00:00Z',
-      refs: new Map(),
-      objects: new Map(),
-      issues: new Map(),
-      pulls: new Map(),
-      labels: new Map(),
-      nextIssue: 1,
-      nextPull: 1,
-    };
+      description: options.description,
+      private: options.private,
+      defaultBranch: options.defaultBranch,
+    }, options.id !== undefined);
     this.repos.set(key, repo);
     return repo;
   }
@@ -280,14 +339,18 @@ export class ForgeStore {
   }
 
   putObject(repo, type, data) {
-    const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const bytes = toBuffer(data);
     const oid = hashObject(type, bytes);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data: bytes });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data: bytes });
+    }
     return oid;
   }
 
   refName(repo, branch) {
-    return branch.startsWith('refs/') ? branch : `refs/heads/${branch || repo.defaultBranch}`;
+    if (branch.startsWith('refs/')) return branch;
+    const selected = branch || repo.defaultBranch;
+    return `refs/heads/${selected}`;
   }
 
   headOid(repo, branch = repo.defaultBranch) {
@@ -297,4 +360,8 @@ export class ForgeStore {
 
 export function seededRepositoryNames() {
   return SEEDED_REPOSITORIES.map(([name]) => name);
+}
+
+export function isKnownObjectType(repo, oid, type) {
+  return objectType(repo, oid) === type;
 }

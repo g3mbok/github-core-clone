@@ -4,92 +4,125 @@ import { handleRest } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { ForgeStore, TOKEN_OWNER } from './store.ts';
+import {
+  cleanBase,
+  collectBody,
+  failureMessage,
+  isHealthProbe,
+  jsonHeaders,
+  rawPath,
+  ROUTE,
+  routeKind,
+  writeFailure,
+  writeFixedJson,
+} from './http.ts';
 
 const environmentUrl = process.env.MAKEFUN_ENV_URL;
 const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 const store = new ForgeStore();
 
-function readBody(req, maxBytes = 64 * 1024 * 1024) {
+const HEALTH_BODY = '{"ok":true}\n';
+const POLL_INTERVAL_MS = 250;
+
+function listen(server) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        reject(new Error('Request body exceeds the allowed size'));
-        req.destroy();
-        return;
-      }
-      chunks.push(Buffer.from(chunk));
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', resolve);
   });
 }
 
-function sendError(res, status, message) {
-  if (res.headersSent) {
-    res.destroy();
-    return;
+function boundPort(server) {
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('The server did not bind to a TCP port');
   }
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'x-github-request-id': 'FORGE00000000',
+  return address.port;
+}
+
+async function register(port) {
+  const response = await fetch(`${cleanBase(environmentUrl)}/register`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    body: JSON.stringify({ port }),
   });
-  res.end(JSON.stringify({ message }));
+  if (!response.ok) {
+    throw new Error(`Registration failed with HTTP ${response.status}`);
+  }
+}
+
+async function readStatus() {
+  const response = await fetch(`${cleanBase(environmentUrl)}/done`);
+  if (!response.ok) {
+    throw new Error(`Environment status polling failed with HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForEnvironment() {
+  for (;;) {
+    const status = await readStatus();
+    if (status.done === true) return;
+    await delay(POLL_INTERVAL_MS);
+  }
+}
+
+function closeServer(server) {
+  return new Promise((resolve, reject) => {
+    server.close((failure) => (
+      failure ? reject(failure) : resolve()
+    ));
+  });
+}
+
+async function dispatch(req, res, url) {
+  // The route table lives in http.ts so this hot path only performs one
+  // classification and then calls the matching handler directly.
+  switch (routeKind(url.pathname)) {
+    case ROUTE.mcp:
+      return handleMcp(req, res, store, token);
+    case ROUTE.graphql:
+      return handleGraphql(req, res, store, token, TOKEN_OWNER);
+    case ROUTE.rest:
+      return handleRest(req, res, url, store, token);
+    case ROUTE.git:
+      return handleGit(req, res, store, url, collectBody);
+    default:
+      return false;
+  }
 }
 
 const server = createServer(async (req, res) => {
-  const rawUrl = req.url ?? '/';
-  // The env's boot check calls this twice before any route is exercised. Keep it as the first
-  // branch: it is the only request that needs no token, no URL parse and no handler chain.
-  if (req.method === 'GET' && rawUrl === '/healthz') {
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': 12 });
-    res.end('{"ok":true}\n');
+  const rawUrl = rawPath(req);
+
+  // The environment checks health before registering any work. Answering here
+  // avoids token checks, URL parsing and the full handler chain.
+  if (isHealthProbe(req, rawUrl)) {
+    writeFixedJson(res, HEALTH_BODY);
     return;
   }
+
   const url = new URL(rawUrl, 'http://localhost');
-  const path = url.pathname;
   try {
-    // Dispatch on the path prefix before calling any handler: the old chain built a second URL in
-    // mcp.ts and graphql.ts on every request, and the read workload makes two thousand of them.
-    if (path === '/mcp') {
-      if (await handleMcp(req, res, store, token)) return;
-    } else if (path === '/api/graphql' || path === '/graphql') {
-      if (await handleGraphql(req, res, store, token, TOKEN_OWNER)) return;
-    } else if (path.startsWith('/api/v3')) {
-      if (await handleRest(req, res, url, store, token)) return;
-    } else if (path.endsWith('.git') || path.includes('.git/')) {
-      if (await handleGit(req, res, store, url, readBody)) return;
-    }
-    sendError(res, 404, 'Not Found');
+    const handled = await dispatch(req, res, url);
+    if (!handled) writeFailure(res, 404, 'Not Found');
   } catch (failure) {
-    sendError(res, 500, failure instanceof Error ? failure.message : 'Internal server error');
+    writeFailure(res, 500, failureMessage(failure));
   }
 });
 
 async function start() {
-  if (!environmentUrl) throw new Error('MAKEFUN_ENV_URL is required');
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '0.0.0.0', resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('The server did not bind to a TCP port');
-  const register = await fetch(`${environmentUrl.replace(/\/+$/, '')}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ port: address.port }),
-  });
-  if (!register.ok) throw new Error(`Registration failed with HTTP ${register.status}`);
-  for (;;) {
-    const response = await fetch(`${environmentUrl.replace(/\/+$/, '')}/done`);
-    if (!response.ok) throw new Error(`Environment status polling failed with HTTP ${response.status}`);
-    const status = await response.json();
-    if (status.done === true) break;
-    await new Promise((resolve) => setTimeout(resolve, 250));
+  if (!environmentUrl) {
+    throw new Error('MAKEFUN_ENV_URL is required');
   }
-  await new Promise((resolve, reject) => server.close((failure) => failure ? reject(failure) : resolve()));
+  await listen(server);
+  const port = boundPort(server);
+  await register(port);
+  await waitForEnvironment();
+  await closeServer(server);
 }
 
 start().catch((failure) => {
