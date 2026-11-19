@@ -113,10 +113,3 @@ export function routeKind(path) {
 export function cleanBase(value) {
   return value.replace(/\/+$/, '');
 }
-
-export function tuneServerSockets(server) {
-  server.on('connection', (socket) => {
-    socket.setNoDelay(true);
-    socket.setKeepAlive(true, 1000);
-  });
-}
