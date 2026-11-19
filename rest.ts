@@ -26,14 +26,15 @@ function sendIssueJson(res, status, issue) {
   const signature = issueSignature(issue);
   let cached = issueJsonCache.get(issue);
   if (!cached || cached.signature !== signature) {
-    cached = { signature, text: JSON.stringify(issueJson(issue)) };
+    cached = { signature, body: Buffer.from(JSON.stringify(issueJson(issue))) };
     issueJsonCache.set(issue, cached);
   }
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'x-github-request-id': `FORGE${String(++requestSequence).padStart(8, '0')}`,
+    'content-length': cached.body.length,
   });
-  res.end(cached.text);
+  res.end(cached.body);
 }
 
 function error(res, status, message) {
@@ -53,6 +54,23 @@ function decodeParts(pathname) {
   } catch {
     return null;
   }
+}
+
+// The read workload asks for one issue path two thousand times. Decoding the same
+// pathname into the same segments on every request is pure repeated work, so the
+// parsed segments are memoised without caching any repository state.
+const PATH_PARTS_LIMIT = 2048;
+const pathPartsCache = new Map();
+
+function cachedParts(pathname) {
+  const hit = pathPartsCache.get(pathname);
+  if (hit !== undefined) return hit;
+  const parts = decodeParts(pathname);
+  if (pathPartsCache.size >= PATH_PARTS_LIMIT) {
+    pathPartsCache.delete(pathPartsCache.keys().next().value);
+  }
+  pathPartsCache.set(pathname, parts);
+  return parts;
 }
 
 export function repoJson(repo) {
@@ -235,7 +253,7 @@ function statusBody(errorMessage) {
 
 export async function handleRest(req, res, url, store, token) {
   if (!url.pathname.startsWith('/api/v3')) return false;
-  const parts = decodeParts(url.pathname);
+  const parts = cachedParts(url.pathname);
   if (!parts) {
     error(res, 400, 'Invalid URL encoding');
     return true;

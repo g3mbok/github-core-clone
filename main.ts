@@ -13,6 +13,7 @@ import {
   rawPath,
   ROUTE,
   routeKind,
+  tuneServerSockets,
   writeFailure,
   writeFixedJson,
 } from './http.ts';
@@ -113,6 +114,8 @@ const server = createServer(async (req, res) => {
     writeFailure(res, 500, failureMessage(failure));
   }
 });
+
+tuneServerSockets(server);
 
 async function start() {
   if (!environmentUrl) {
