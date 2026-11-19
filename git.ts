@@ -22,8 +22,11 @@ function stateSignature(repo) {
       hash = Math.imul(hash, 16777619);
     }
   };
+  // Objects are immutable and content-addressed, and a fetch only returns objects reachable from the
+  // refs in play. So the refs plus the object count fully determine every reply: two states with the
+  // same refs and the same count have the same answers. Hashing all object ids on every request
+  // would cost more than the pack generation it saves once the store holds hundreds of objects.
   feed(`${repo.id}|${repo.objects.size}|${repo.refs.size}`);
-  for (const oid of repo.objects.keys()) feed(oid);
   for (const [name, oid] of repo.refs) { feed(name); feed(oid); }
   return hash >>> 0;
 }
